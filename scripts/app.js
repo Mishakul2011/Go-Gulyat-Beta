@@ -28,12 +28,17 @@ const MOTION = Object.freeze({
 
 const CONFETTI = Object.freeze({
   colors: ["#5877B8", "#E7776E", "#E8B94F", "#55A893", "#8A6FB4", "#D85D88"],
-  pieces: 176,
-  reducedPieces: 64,
-  emissionMs: 1250,
+  pieces: 480,
+  reducedPieces: 160,
+  emissionMs: 1750,
   gravity: 620,
-  maxSettled: 170,
-  maxTiltGravity: 360,
+  maxTiltGravity: 680,
+  airDamping: 0.996,
+  wallFriction: 0.82,
+  wallBounce: 0.22,
+  particleBounce: 0.16,
+  maxSpeed: 900,
+  collisionCellSize: 18,
 });
 
 const question = document.querySelector("#question");
@@ -391,7 +396,6 @@ function clampFloatingNoButton() {
 
 const confettiState = {
   particles: [],
-  pile: [],
   width: 0,
   height: 0,
   dpr: 1,
@@ -416,24 +420,40 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+function rotateGravityToScreen(x, y) {
+  const screenAngle = Number(window.screen?.orientation?.angle ?? window.orientation ?? 0);
+  const angle = (screenAngle * Math.PI) / 180;
+  return {
+    x: x * Math.cos(angle) + y * Math.sin(angle),
+    y: -x * Math.sin(angle) + y * Math.cos(angle),
+  };
+}
+
+function setGravityTarget(x, y) {
+  const magnitude = Math.hypot(x, y);
+  const scale = magnitude > 1 ? 1 / magnitude : 1;
+  sensorState.targetGravityX = clamp(
+    x * scale * CONFETTI.gravity,
+    -CONFETTI.maxTiltGravity,
+    CONFETTI.maxTiltGravity,
+  );
+  sensorState.targetGravityY = clamp(
+    y * scale * CONFETTI.gravity,
+    -CONFETTI.maxTiltGravity,
+    CONFETTI.maxTiltGravity,
+  );
+}
+
 function updateOrientationGravity(event) {
   if (!Number.isFinite(event.gamma) && !Number.isFinite(event.beta)) return;
 
   const gamma = Number.isFinite(event.gamma) ? event.gamma : 0;
-  const beta = Number.isFinite(event.beta) ? event.beta : 45;
-  const screenAngle = Number(window.screen?.orientation?.angle ?? window.orientation ?? 0);
-  let horizontalTilt = gamma;
+  const beta = Number.isFinite(event.beta) ? event.beta : 0;
+  const deviceGravityX = Math.sin((gamma * Math.PI) / 180);
+  const deviceGravityY = Math.sin((beta * Math.PI) / 180);
+  const screenGravity = rotateGravityToScreen(deviceGravityX, deviceGravityY);
 
-  if (Math.abs(screenAngle) === 90) {
-    horizontalTilt = (beta - 45) * (screenAngle === 90 ? -1 : 1);
-  }
-
-  sensorState.targetGravityX = clamp(
-    (horizontalTilt / 45) * CONFETTI.maxTiltGravity,
-    -CONFETTI.maxTiltGravity,
-    CONFETTI.maxTiltGravity,
-  );
-  sensorState.targetGravityY = CONFETTI.gravity * clamp(0.86 + Math.abs(beta) / 500, 0.86, 1.08);
+  setGravityTarget(screenGravity.x, screenGravity.y);
   sensorState.lastOrientationAt = performance.now();
 }
 
@@ -441,14 +461,13 @@ function updateMotionGravity(event) {
   if (performance.now() - sensorState.lastOrientationAt < 800) return;
 
   const acceleration = event.accelerationIncludingGravity;
-  if (!acceleration || !Number.isFinite(acceleration.x)) return;
+  if (!acceleration || !Number.isFinite(acceleration.x) || !Number.isFinite(acceleration.y)) return;
 
-  sensorState.targetGravityX = clamp(
-    acceleration.x * 42,
-    -CONFETTI.maxTiltGravity,
-    CONFETTI.maxTiltGravity,
+  const screenGravity = rotateGravityToScreen(
+    acceleration.x / 9.81,
+    acceleration.y / 9.81,
   );
-  sensorState.targetGravityY = CONFETTI.gravity;
+  setGravityTarget(screenGravity.x, screenGravity.y);
 }
 
 function listenForOrientation() {
@@ -524,20 +543,18 @@ function resizeCanvas() {
     const scaleX = rect.width / oldWidth;
     const scaleY = rect.height / oldHeight;
     confettiState.particles.forEach((particle) => {
-      particle.x *= scaleX;
-      particle.y *= scaleY;
+      particle.x = clamp(particle.x * scaleX, particle.radius, rect.width - particle.radius);
+      particle.y = clamp(particle.y * scaleY, particle.radius, rect.height - particle.radius);
     });
   }
 
-  const binCount = Math.max(12, Math.ceil(rect.width / 18));
-  if (confettiState.pile.length !== binCount) confettiState.pile = new Array(binCount).fill(0);
   drawConfetti();
 }
 
 function makeParticle(side) {
   const fromLeft = side === "left";
-  const width = randomBetween(5, 10);
-  const height = randomBetween(10, 20);
+  const width = randomBetween(4, 8.5);
+  const height = randomBetween(8, 16);
   const y = randomBetween(confettiState.height * 0.43, confettiState.height * 0.82);
 
   return {
@@ -545,6 +562,7 @@ function makeParticle(side) {
     y,
     width,
     height,
+    radius: (width + height) * 0.23,
     vx: randomBetween(150, 360) * (fromLeft ? 1 : -1),
     vy: randomBetween(-430, -165),
     angle: randomBetween(0, Math.PI * 2),
@@ -553,8 +571,6 @@ function makeParticle(side) {
     wobble: randomBetween(0, Math.PI * 2),
     wobbleSpeed: randomBetween(4, 8),
     drag: randomBetween(0.986, 0.996),
-    landed: false,
-    bounced: false,
   };
 }
 
@@ -571,46 +587,113 @@ function emitConfetti(time) {
   }
 }
 
-function settleParticle(particle) {
-  const bins = confettiState.pile;
-  const binWidth = confettiState.width / bins.length;
-  const index = Math.max(0, Math.min(bins.length - 1, Math.floor(particle.x / binWidth)));
-  const maxPile = Math.min(54, confettiState.height * 0.085);
-  const level = Math.min(maxPile, bins[index] + randomBetween(2.5, 5.5));
-  bins[index] = level;
-  if (index > 0) bins[index - 1] = Math.min(maxPile, bins[index - 1] + 0.7);
-  if (index < bins.length - 1) bins[index + 1] = Math.min(maxPile, bins[index + 1] + 0.7);
+function resolveBoundaryCollisions(particle) {
+  const minX = particle.radius;
+  const maxX = confettiState.width - particle.radius;
+  const minY = particle.radius;
+  const maxY = confettiState.height - particle.radius;
 
-  particle.y = confettiState.height - 7 - level - particle.height * 0.28;
-  particle.vx = 0;
-  particle.vy = 0;
-  particle.spin = 0;
-  particle.angle += randomBetween(-0.28, 0.28);
-  particle.landed = true;
+  if (particle.x < minX) {
+    particle.x = minX;
+    if (particle.vx < 0) particle.vx *= -CONFETTI.wallBounce;
+    particle.vy *= CONFETTI.wallFriction;
+    particle.spin *= 0.9;
+  } else if (particle.x > maxX) {
+    particle.x = maxX;
+    if (particle.vx > 0) particle.vx *= -CONFETTI.wallBounce;
+    particle.vy *= CONFETTI.wallFriction;
+    particle.spin *= 0.9;
+  }
+
+  if (particle.y < minY) {
+    particle.y = minY;
+    if (particle.vy < 0) particle.vy *= -CONFETTI.wallBounce;
+    particle.vx *= CONFETTI.wallFriction;
+    particle.spin *= 0.9;
+  } else if (particle.y > maxY) {
+    particle.y = maxY;
+    if (particle.vy > 0) particle.vy *= -CONFETTI.wallBounce;
+    particle.vx *= CONFETTI.wallFriction;
+    particle.spin *= 0.9;
+  }
 }
 
 function updateParticle(particle, delta) {
-  if (particle.landed) return;
-
   particle.vx += sensorState.gravityX * delta;
   particle.vy += sensorState.gravityY * delta;
-  particle.vx *= Math.pow(particle.drag, delta * 60);
+  const damping = Math.pow(CONFETTI.airDamping * particle.drag, delta * 60);
+  particle.vx *= damping;
+  particle.vy *= damping;
+  const speed = Math.hypot(particle.vx, particle.vy);
+  if (speed > CONFETTI.maxSpeed) {
+    const speedScale = CONFETTI.maxSpeed / speed;
+    particle.vx *= speedScale;
+    particle.vy *= speedScale;
+  }
   particle.x += particle.vx * delta;
   particle.y += particle.vy * delta;
   particle.angle += particle.spin * delta;
   particle.wobble += particle.wobbleSpeed * delta;
+  particle.spin *= Math.pow(0.998, delta * 60);
+  resolveBoundaryCollisions(particle);
+}
 
-  const floor = confettiState.height - 8;
-  if (particle.y + particle.height * 0.5 >= floor && particle.vy > 0) {
-    if (!particle.bounced && Math.abs(particle.vy) > 115 && Math.random() < 0.52) {
-      particle.y = floor - particle.height * 0.5;
-      particle.vy *= -randomBetween(0.12, 0.24);
-      particle.vx *= 0.55;
-      particle.bounced = true;
-    } else {
-      settleParticle(particle);
+function resolveParticleCollisions() {
+  const grid = new Map();
+  const cellSize = CONFETTI.collisionCellSize;
+
+  confettiState.particles.forEach((particle, index) => {
+    const cellX = Math.floor(particle.x / cellSize);
+    const cellY = Math.floor(particle.y / cellSize);
+    const key = `${cellX}:${cellY}`;
+    const bucket = grid.get(key);
+    if (bucket) bucket.push(index);
+    else grid.set(key, [index]);
+  });
+
+  confettiState.particles.forEach((particle, index) => {
+    const cellX = Math.floor(particle.x / cellSize);
+    const cellY = Math.floor(particle.y / cellSize);
+
+    for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+      for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
+        const bucket = grid.get(`${cellX + offsetX}:${cellY + offsetY}`);
+        if (!bucket) continue;
+
+        bucket.forEach((otherIndex) => {
+          if (otherIndex <= index) return;
+          const other = confettiState.particles[otherIndex];
+          const dx = other.x - particle.x;
+          const dy = other.y - particle.y;
+          const minDistance = (particle.radius + other.radius) * 0.86;
+          const distanceSquared = dx * dx + dy * dy;
+          if (distanceSquared >= minDistance * minDistance) return;
+
+          const distance = Math.sqrt(distanceSquared) || 0.001;
+          const normalX = dx / distance;
+          const normalY = dy / distance;
+          const overlap = minDistance - distance;
+          particle.x -= normalX * overlap * 0.5;
+          particle.y -= normalY * overlap * 0.5;
+          other.x += normalX * overlap * 0.5;
+          other.y += normalY * overlap * 0.5;
+
+          const relativeVelocity =
+            (other.vx - particle.vx) * normalX +
+            (other.vy - particle.vy) * normalY;
+          if (relativeVelocity < 0) {
+            const impulse = -((1 + CONFETTI.particleBounce) * relativeVelocity) / 2;
+            particle.vx -= impulse * normalX;
+            particle.vy -= impulse * normalY;
+            other.vx += impulse * normalX;
+            other.vy += impulse * normalY;
+          }
+        });
+      }
     }
-  }
+  });
+
+  confettiState.particles.forEach(resolveBoundaryCollisions);
 }
 
 function drawConfetti() {
@@ -618,10 +701,10 @@ function drawConfetti() {
 
   confettiState.particles.forEach((particle) => {
     context.save();
-    context.translate(particle.x + Math.sin(particle.wobble) * (particle.landed ? 0 : 2.2), particle.y);
+    context.translate(particle.x + Math.sin(particle.wobble) * 1.6, particle.y);
     context.rotate(particle.angle);
     context.fillStyle = particle.color;
-    context.globalAlpha = particle.landed ? 0.92 : 0.96;
+    context.globalAlpha = 0.96;
     context.fillRect(-particle.width / 2, -particle.height / 2, particle.width, particle.height);
     context.restore();
   });
@@ -638,21 +721,8 @@ function animateConfetti(time) {
 
   emitConfetti(time);
   confettiState.particles.forEach((particle) => updateParticle(particle, delta));
+  resolveParticleCollisions();
   drawConfetti();
-
-  const emissionDone = confettiState.emitted >= (
-    window.matchMedia("(prefers-reduced-motion: reduce)").matches
-      ? CONFETTI.reducedPieces
-      : CONFETTI.pieces
-  );
-  const allLanded = emissionDone && confettiState.particles.every((particle) => particle.landed);
-
-  if (allLanded) {
-    confettiState.running = false;
-    confettiState.particles = confettiState.particles.slice(-CONFETTI.maxSettled);
-    drawConfetti();
-    return;
-  }
 
   confettiState.frameId = requestAnimationFrame(animateConfetti);
 }
@@ -660,7 +730,6 @@ function animateConfetti(time) {
 function launchConfetti() {
   cancelAnimationFrame(confettiState.frameId);
   confettiState.particles = [];
-  confettiState.pile.fill(0);
   confettiState.emitted = 0;
   confettiState.running = true;
   confettiState.startedAt = performance.now();
